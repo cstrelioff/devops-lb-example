@@ -1,0 +1,162 @@
+---
+- hosts: all
+  become: true
+  vars:
+    username: ansibleuser
+    domain: example.com
+    local_html: _site
+
+  tasks:
+  #
+  # SERVER SETUP
+  #
+  # reference 
+  # https://www.digitalocean.com/community/tutorials/how-to-use-ansible-to-automate-initial-server-setup-on-ubuntu-22-04
+  #
+    - name: Setup passwordless sudo
+      lineinfile:
+        path: /etc/sudoers
+        state: present
+        regexp: '^%sudo'
+        line: '%sudo ALL=(ALL) NOPASSWD: ALL'
+        validate: '/usr/sbin/visudo -cf %s'
+      tags: [ never, setup ]
+
+    - name: Create a new regular user with sudo privileges
+      user:
+        name: "{{ username }}"
+        state: present
+        groups: sudo
+        append: true
+        create_home: true
+      tags: [ never, setup ]
+
+    - name: Set authorized key for remote user
+      ansible.posix.authorized_key:
+        user: "{{ username }}"
+        state: present
+        key: "{{ lookup('file', 'ssh/ansible_user.pub') }}"
+      tags: [ never, setup ]
+
+    - name: Disable password authentication for root
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        state: present
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin prohibit-password'
+      tags: [ never, setup ]
+
+  #
+  # SERVER UPDATE
+  #
+  # reference 
+  # https://www.jeffgeerling.com/blog/2022/ansible-playbook-upgrade-ubuntudebian-servers-and-reboot-if-needed
+  # - some commands out of date
+  #
+    - name: Run apt update and apt upgrade
+      ansible.builtin.apt:
+        upgrade: yes
+        update_cache: yes
+        cache_valid_time: 86400 # one day, in seconds
+      tags: [ never, update ]
+
+    - name: Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+        get_checksum: false
+      register: reboot_required_file
+      tags: [ never, update ]
+
+    - name: Reboot the server (if needed)
+      ansible.builtin.reboot:
+      when: reboot_required_file.stat.exists == true
+      tags: [ never, update ]
+
+    - name: Autoremove deps that are no longer needed
+      ansible.builtin.apt:
+        autoremove: true
+      tags: [ never, update ]
+
+  #
+  #
+  # NGINX SETUP
+  #
+  #
+    - name: Update apt and install required system packages
+      apt:
+        pkg:
+          - nginx
+        state: latest
+        update_cache: true
+      tags: [ never, nginx_setup ]
+
+    - name: Ensure Nginx is runnning
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+      tags: [ never, nginx_setup ]
+
+    - name: Create remote html directory
+      ansible.builtin.file:
+        path: /var/www/{{ domain }}/html
+        state: directory
+        mode: '0755'
+      tags: [ never, nginx_setup ]
+
+    - name: Change ownership of html directory to ansibleuser
+      ansible.builtin.file:
+        path: /var/www/{{ domain }}/html
+        state: directory
+        recurse: yes
+        owner: ansibleuser
+        group: ansibleuser
+      tags: [ never, nginx_setup ]
+
+    - name: Apply Nginx template
+      template:
+        src: ansible_files/nginx.conf.j2
+        dest: /etc/nginx/sites-available/default
+      notify: Restart Nginx
+      tags: [ never, nginx_setup ]
+
+    - name: Enable new site
+      file:
+        src: /etc/nginx/sites-available/default
+        dest: /etc/nginx/sites-enabled/default
+        state: link
+      notify: Restart Nginx
+      tags: [ never, nginx_setup ]
+
+  #
+  #
+  # WEB RSYNC
+  #
+  #
+    - name: rsync local html with server html directory
+      ansible.builtin.shell:
+        cmd: "rsync -av -e 'ssh -o \"IdentitiesOnly=yes\" -i ssh/ansible_user' {{ local_html }}/ ansibleuser@{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}:/var/www/{{ domain }}/html/"
+      delegate_to: localhost
+      register: rsync_output
+      tags: [ never, web_rsync ]
+      vars:
+        ansible_become: false
+
+    - name: Print rsync output
+      debug:
+        var: rsync_output.stdout_lines
+      tags: [ never, web_rsync ]
+      vars:
+        ansible_become: false
+
+  #
+  #
+  # HANDLERS
+  #
+  #
+  handlers:
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
+   
